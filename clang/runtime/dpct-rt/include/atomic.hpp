@@ -454,6 +454,122 @@ inline T1 atomic_fetch_max(T1 *addr, T2 operand,
   atomic_fetch_max<T1, addressSpace>(addr, operand, memoryOrder);
 }
 
+namespace experimental {
+
+#if defined(__NVPTX__) && defined(__SYCL_DEVICE_ONLY__)
+
+#define __NVVM_ATOM_INCDEC_ORDER(ADDR_SPACE, ADDR_SPACE_NV, OP, ORDER)         \
+  switch (memoryScope) {                                                       \
+  case sycl::memory_scope::work_item:                                          \
+    [[fallthrough]];                                                           \
+  case sycl::memory_scope::sub_group:                                          \
+    [[fallthrough]];                                                           \
+  case sycl::memory_scope::work_group:                                         \
+    if constexpr (get_cuda_sm_version() >= 600) {                              \
+      return __nvvm_atom##ORDER##_cta_##OP##_##ADDR_SPACE_NV##_ui(addr,        \
+                                                                  operand);    \
+    }                                                                          \
+    break;                                                                     \
+  case sycl::memory_scope::system:                                             \
+    if constexpr (get_cuda_sm_version() >= 600) {                              \
+      return __nvvm_atom##ORDER##_sys_##OP##_##ADDR_SPACE_NV##_ui(addr,        \
+                                                                  operand);    \
+    }                                                                          \
+    break;                                                                     \
+  case sycl::memory_scope::device:                                             \
+    return __nvvm_atom##ORDER##_##OP##_##ADDR_SPACE_NV##_ui(addr, operand);    \
+  default:                                                                     \
+    break;                                                                     \
+  }
+
+#define __NVVM_ATOM_INCDEC_ACQUIRE_FENCE(ADDR_SPACE, ADDR_SPACE_NV, OP)        \
+  switch (memoryScope) {                                                       \
+  case sycl::memory_scope::work_item:                                          \
+    [[fallthrough]];                                                           \
+  case sycl::memory_scope::sub_group:                                          \
+    [[fallthrough]];                                                           \
+  case sycl::memory_scope::work_group:                                         \
+    if constexpr (get_cuda_sm_version() >= 600) {                              \
+      unsigned int res =                                                       \
+          __nvvm_atom_cta_##OP##_##ADDR_SPACE_NV##_ui(addr, operand);          \
+      atomic_fence(sycl::memory_order::acquire, memoryScope);                  \
+      return res;                                                              \
+    }                                                                          \
+    break;                                                                     \
+  case sycl::memory_scope::system:                                             \
+    if constexpr (get_cuda_sm_version() >= 600) {                              \
+      unsigned int res =                                                       \
+          __nvvm_atom_sys_##OP##_##ADDR_SPACE_NV##_ui(addr, operand);          \
+      atomic_fence(sycl::memory_order::acquire, memoryScope);                  \
+      return res;                                                              \
+    }                                                                          \
+    break;                                                                     \
+  case sycl::memory_scope::device: {                                           \
+    unsigned int res = __nvvm_atom_##OP##_##ADDR_SPACE_NV##_ui(addr, operand); \
+    atomic_fence(sycl::memory_order::acquire, memoryScope);                    \
+    return res;                                                                \
+  }                                                                            \
+  default:                                                                     \
+    break;                                                                     \
+  }
+
+#define __NVVM_ATOM_INCDEC(ADDR_SPACE, ADDR_SPACE_NV, OP)                      \
+  template <sycl::memory_order memoryOrder, sycl::memory_scope memoryScope>    \
+  inline constexpr unsigned int nvvm_atomic_##OP##_scoped_##ADDR_SPACE(        \
+      unsigned int *addr, unsigned int operand) {                              \
+    constexpr auto get_cuda_sm_version = []() -> int {                         \
+      return __SYCL_CUDA_ARCH__;                                               \
+    };                                                                         \
+    switch (memoryOrder) {                                                     \
+    case sycl::memory_order::acquire:                                          \
+      if constexpr (get_cuda_sm_version() >= 700) {                            \
+        __NVVM_ATOM_INCDEC_ORDER(ADDR_SPACE, ADDR_SPACE_NV, OP, _acquire)      \
+      } else {                                                                 \
+        __NVVM_ATOM_INCDEC_ACQUIRE_FENCE(ADDR_SPACE, ADDR_SPACE_NV, OP)        \
+      }                                                                        \
+      break;                                                                   \
+    case sycl::memory_order::release:                                          \
+      if constexpr (get_cuda_sm_version() >= 700) {                            \
+        __NVVM_ATOM_INCDEC_ORDER(ADDR_SPACE, ADDR_SPACE_NV, OP, _release)      \
+      } else {                                                                 \
+        atomic_fence(sycl::memory_order::release, memoryScope);                \
+        __NVVM_ATOM_INCDEC_ORDER(ADDR_SPACE, ADDR_SPACE_NV, OP, )              \
+      }                                                                        \
+      break;                                                                   \
+    case sycl::memory_order::acq_rel:                                          \
+      if constexpr (get_cuda_sm_version() >= 700) {                            \
+        __NVVM_ATOM_INCDEC_ORDER(ADDR_SPACE, ADDR_SPACE_NV, OP, _acq_rel)      \
+      } else {                                                                 \
+        atomic_fence(sycl::memory_order::release, memoryScope);                \
+        __NVVM_ATOM_INCDEC_ACQUIRE_FENCE(ADDR_SPACE, ADDR_SPACE_NV, OP)        \
+      }                                                                        \
+      break;                                                                   \
+    case sycl::memory_order::relaxed:                                          \
+    default: {                                                                 \
+      __NVVM_ATOM_INCDEC_ORDER(ADDR_SPACE, ADDR_SPACE_NV, OP, )                \
+      break;                                                                   \
+    }                                                                          \
+    }                                                                          \
+    __builtin_trap();                                                          \
+    __builtin_unreachable();                                                   \
+  }
+
+//__NVVM_ATOM_INCDEC_ORDER(ADDR_SPACE, ADDR_SPACE_NV, OP, )
+
+// Generate atomic fetch-compare-increment implementation to use NVVM atomics
+__NVVM_ATOM_INCDEC(generic, gen, inc)
+__NVVM_ATOM_INCDEC(global, global, inc)
+__NVVM_ATOM_INCDEC(local, shared, inc)
+
+// Generate atomic fetch-compare-decrement implementation to use NVVM atomics
+__NVVM_ATOM_INCDEC(generic, gen, dec)
+__NVVM_ATOM_INCDEC(global, global, dec)
+__NVVM_ATOM_INCDEC(local, shared, dec)
+
+#endif
+
+} // namespace experimental
+
 /// Atomically set \p operand to the value stored in \p addr, if old value stored in
 /// \p addr is equal to zero or greater than \p operand, else decrease the value stored
 /// in \p addr.
@@ -466,6 +582,28 @@ template <sycl::access::address_space addressSpace = sycl::access::address_space
           sycl::memory_scope memoryScope = sycl::memory_scope::device>
 inline unsigned int atomic_fetch_compare_dec(unsigned int *addr,
                                              unsigned int operand) {
+#if defined(__NVPTX__) && defined(__SYCL_DEVICE_ONLY__)
+  if constexpr (addressSpace == sycl::access::address_space::generic_space) {
+    return experimental::nvvm_atomic_dec_scoped_generic<memoryOrder,
+                                                        memoryScope>(addr,
+                                                                     operand);
+  } else if constexpr (addressSpace ==
+                       sycl::access::address_space::global_space) {
+    return experimental::nvvm_atomic_dec_scoped_global<memoryOrder,
+                                                       memoryScope>(addr,
+                                                                    operand);
+  } else if constexpr (addressSpace ==
+                       sycl::access::address_space::local_space) {
+    return experimental::nvvm_atomic_dec_scoped_local<memoryOrder, memoryScope>(
+        addr, operand);
+  } else {
+    static_assert(false,
+                  "Invalid address_space for atomics. Valid address_space for "
+                  "atomics: sycl::access::address_space::generic_space, "
+                  "sycl::access::address_space::global_space, "
+                  "sycl::access::address_space::local_space!");
+  }
+#else
   auto atm = sycl::atomic_ref<unsigned int, memoryOrder, memoryScope,
                                   addressSpace>(addr[0]);
   unsigned int old;
@@ -480,6 +618,7 @@ inline unsigned int atomic_fetch_compare_dec(unsigned int *addr,
 	}
 
   return old;
+#endif
 }
 
 /// Atomically increment the value stored in \p addr if old value stored in \p
@@ -494,6 +633,28 @@ template <sycl::access::address_space addressSpace =
           sycl::memory_scope memoryScope = sycl::memory_scope::device>
 inline unsigned int atomic_fetch_compare_inc(unsigned int *addr,
                                              unsigned int operand) {
+#if defined(__NVPTX__) && defined(__SYCL_DEVICE_ONLY__)
+  if constexpr (addressSpace == sycl::access::address_space::generic_space) {
+    return experimental::nvvm_atomic_inc_scoped_generic<memoryOrder,
+                                                        memoryScope>(addr,
+                                                                     operand);
+  } else if constexpr (addressSpace ==
+                       sycl::access::address_space::global_space) {
+    return experimental::nvvm_atomic_inc_scoped_global<memoryOrder,
+                                                       memoryScope>(addr,
+                                                                    operand);
+  } else if constexpr (addressSpace ==
+                       sycl::access::address_space::local_space) {
+    return experimental::nvvm_atomic_inc_scoped_local<memoryOrder, memoryScope>(
+        addr, operand);
+  } else {
+    static_assert(false,
+                  "Invalid address_space for atomics. Valid address_space for "
+                  "atomics: sycl::access::address_space::generic_space, "
+                  "sycl::access::address_space::global_space, "
+                  "sycl::access::address_space::local_space!");
+  }
+#else
   auto atm = sycl::atomic_ref<unsigned int, memoryOrder, memoryScope,
                                   addressSpace>(addr[0]);
   unsigned int old;
@@ -506,6 +667,7 @@ inline unsigned int atomic_fetch_compare_inc(unsigned int *addr,
       break;
   }
   return old;
+#endif
 }
 
 /// Atomically increment the value stored in \p addr if old value stored in \p
